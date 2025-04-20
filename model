@@ -1,0 +1,333 @@
+# 定义bert上的模型结构
+class ConvolutionLayer(nn.Module):
+
+    def __init__(self, input_size, channels, dilation, dropout=0.1):
+        super(ConvolutionLayer, self).__init__()
+        self.base = nn.Sequential(
+            nn.Dropout2d(dropout),
+            nn.Conv2d(input_size, channels, kernel_size=1),
+            nn.GELU(),
+        )
+
+        self.convs = nn.ModuleList(
+            [nn.Conv2d(channels, channels, kernel_size=3, groups=channels, dilation=d, padding=d) for d in dilation])
+
+    def forward(self, x):
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.base(x)
+
+        outputs = []
+        for conv in self.convs:
+            x = conv(x)
+            x = F.gelu(x)
+            outputs.append(x)
+        outputs = torch.cat(outputs, dim=1)
+        outputs = outputs.permute(0, 2, 3, 1).contiguous()
+        return outputs
+
+# Hiformer模型结构
+class Hiformer(nn.Module):
+   
+  def __init__(self, d_model, d_char, d_lex, d_syn, n_heads, n_layers, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        
+        # 将输入嵌入映射到模型维度
+        self.char_embed_proj = nn.Linear(d_char, d_model)
+        self.lex_embed_proj = nn.Linear(d_lex, d_model)
+        self.syn_embed_proj = nn.Linear(d_syn, d_model)
+        
+        # 定义相对位置编码
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        
+        # 定义编码器层
+        encoder_layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=2048, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, n_layers)
+        
+        # 多头注意力层
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.cross_attn_char_lex = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.cross_attn_char_syn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.cross_attn_lex_syn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 2048),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(2048, d_model),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, char_embeddings, lex_embeddings, syn_embeddings):
+        # 映射输入嵌入到模型维度
+        char_embeddings = self.char_embed_proj(char_embeddings)
+        lex_embeddings = self.lex_embed_proj(lex_embeddings)
+        syn_embeddings = self.syn_embed_proj(syn_embeddings)
+        
+        # 添加位置编码
+        char_embeddings = self.pos_encoder(char_embeddings)
+        lex_embeddings = self.pos_encoder(lex_embeddings)
+        syn_embeddings = self.pos_encoder(syn_embeddings)
+        
+        # 自注意力
+        char_output = self.transformer_encoder(char_embeddings)
+        lex_output = self.transformer_encoder(lex_embeddings)
+        syn_output = self.transformer_encoder(syn_embeddings)
+        
+        # 交叉注意力
+        char_lex_output, _ = self.cross_attn_char_lex(char_output, lex_output, lex_output)
+        char_syn_output, _ = self.cross_attn_char_syn(char_output, syn_output, syn_output)
+        lex_syn_output, _ = self.cross_attn_lex_syn(lex_output, syn_output, syn_output)
+        
+        # 融合嵌入
+        fused_output = char_lex_output + char_syn_output + lex_syn_output
+        fused_output = self.ffn(fused_output)
+        
+        return fused_output
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+# 仿射变化
+class Biaffine(nn.Module):
+
+    def __init__(self, n_in, n_out=1, bias_x=True, bias_y=True):
+        super(Biaffine, self).__init__()
+
+        self.n_in = n_in
+        self.n_out = n_out
+        self.bias_x = bias_x
+        self.bias_y = bias_y
+        weight = torch.zeros((n_out, n_in + int(bias_x), n_in + int(bias_y)))
+        nn.init.xavier_normal_(weight)
+        self.weight = nn.Parameter(weight, requires_grad=True)
+
+    def extra_repr(self):
+        s = f"n_in={self.n_in}, n_out={self.n_out}"
+        if self.bias_x:
+            s += f", bias_x={self.bias_x}"
+        if self.bias_y:
+            s += f", bias_y={self.bias_y}"
+
+        return s
+
+    def forward(self, x, y):
+        if self.bias_x:
+            x = torch.cat((x, torch.ones_like(x[..., :1])), -1)
+        if self.bias_y:
+            y = torch.cat((y, torch.ones_like(y[..., :1])), -1)
+        # [batch_size, n_out, seq_len, seq_len]
+        s = torch.einsum('bxi,oij,byj->boxy', x, self.weight, y)
+        # remove dim 1 if n_out == 1
+        s = s.permute(0, 2, 3, 1)
+
+        return s
+
+# MLP
+class MLP(nn.Module):
+
+    def __init__(self, n_in, n_out, dropout=0):
+        super().__init__()
+
+        self.linear = nn.Linear(n_in, n_out)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.dropout(x)
+        x = self.linear(x)
+        x = self.activation(x)
+        return x
+
+# 注意力融合模块
+class AttentionFusion(nn.Module):
+    def __init__(self, input_dim, window_size, beta=0.5):
+        super(AttentionFusion, self).__init__()
+        self.input_dim = input_dim
+        self.window_size = window_size
+        self.beta = beta
+        self.local_attention = LocalAttention(input_dim, window_size)
+        self.global_attention = GlobalAttention(input_dim)
+
+    def forward(self, inputs):
+        batch_size, seq_len, _ = inputs.size()
+        local_attn = self.local_attention(inputs)
+        global_attn = self.global_attention(inputs)
+        fused_attn = self.beta * local_attn + (1 - self.beta) * global_attn
+        outputs = torch.bmm(fused_attn.view(batch_size, 1, seq_len * seq_len), inputs.view(batch_size, seq_len * seq_len, self.input_dim))
+        return outputs
+
+class LocalAttention(nn.Module):
+    def __init__(self, input_dim, window_size):
+        super(LocalAttention, self).__init__()
+        self.input_dim = input_dim
+        self.window_size = window_size
+        self.query = nn.Linear(input_dim, input_dim)
+        self.key = nn.Linear(input_dim, input_dim)
+
+    def forward(self, inputs):
+        batch_size, seq_len, _ = inputs.size()
+        queries = self.query(inputs).view(batch_size, seq_len, self.input_dim)
+        keys = self.key(inputs).view(batch_size, seq_len, self.input_dim)
+        attention_scores = torch.bmm(queries, keys.transpose(1, 2))
+        padded_mask = torch.ones(batch_size, seq_len, seq_len)
+        padding_window = self.window_size // 2
+        padded_mask[:, :, :padding_window] = 0
+        padded_mask[:, :, -padding_window:] = 0
+        for i in range(padding_window, seq_len - padding_window):
+            padded_mask[:, i, i - padding_window:i + padding_window + 1] = 1
+        attention_scores = attention_scores.masked_fill(padded_mask == 0, -1e9)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        return attention_weights
+
+class GlobalAttention(nn.Module):
+    def __init__(self, input_dim):
+        super(GlobalAttention, self).__init__()
+        self.input_dim = input_dim
+        self.query = nn.Linear(input_dim, input_dim)
+        self.key = nn.Linear(input_dim, input_dim)
+
+    def forward(self, inputs):
+        batch_size, seq_len, _ = inputs.size()
+        queries = self.query(inputs).view(batch_size, seq_len, self.input_dim)
+        keys = self.key(inputs).view(batch_size, seq_len, self.input_dim)
+        attention_scores = torch.bmm(queries, keys.transpose(1, 2))
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        return attention_weights
+
+class DualPathGateFusion(nn.Module):
+    def __init__(self, dt):
+        super(DualPathGateFusion, self).__init__()
+        self.dt = dt
+        
+        # 初始化可学习参数
+        self.Wg = nn.Linear(2 * dt, dt)
+        self.bg = nn.Parameter(torch.zeros(dt))
+        
+    def forward(self, ei, ej):
+        # 拼接特征向量
+        concatenated = torch.cat([ei, ej], dim=-1)
+        
+        # 计算门控系数
+        g = torch.sigmoid(self.Wg(concatenated) + self.bg)
+        
+        # 动态权重分配
+        fused = g * ei + (1 - g) * ej
+        
+        return fused
+
+class HierarchicalAttentionFusion(nn.Module):
+    def __init__(self, dt, event_types):
+        super(HierarchicalAttentionFusion, self).__init__()
+        self.dt = dt
+        self.event_types = event_types
+        
+        # 初始化事件类型嵌入
+        self.event_type_embed = nn.Embedding(event_types, dt)
+        
+        # 初始化双路径门控融合机制
+        self.dual_path_gate = DualPathGateFusion(dt)
+        
+    def forward(self, grid_features, event_type):
+        # 获取事件类型嵌入
+        event_embed = self.event_type_embed(event_type)
+        
+        # 双路径门控融合
+        fused_features = self.dual_path_gate(grid_features, event_embed)
+        
+        # 局部注意力机制
+        local_attention = self.local_attention(fused_features)
+        
+        # 全局注意力机制
+        global_attention = self.global_attention(fused_features)
+        
+        # 动态整合多粒度信息
+        combined = fused_features * local_attention + fused_features * global_attention
+        
+        return combined
+    
+    def local_attention(self, features):
+        # 实现局部注意力机制
+        # 这里简化实现，实际应用中可以根据需要调整窗口大小和相似度计算方法
+        window_size = 3
+        padding = window_size // 2
+        padded = F.pad(features, (0, 0, padding, padding))
+        
+        local_weights = []
+        for i in range(features.size(0)):
+            window = padded[i:i+window_size]
+            weights = F.softmax(torch.matmul(features[i], window.T), dim=-1)
+            local_weights.append(weights)
+        
+        return torch.stack(local_weights)
+    
+    def global_attention(self, features):
+        # 实现全局注意力机制
+        # 计算特征之间的相似度
+        similarity = torch.matmul(features, features.T)
+        global_weights = F.softmax(similarity, dim=-1)
+        
+        return global_weights
+
+class HiEEFeatureFusionLayer(nn.Module):
+    def __init__(self, char_dim, lex_dim, synt_dim, dt, event_types):
+        super(HiEEFeatureFusionLayer, self).__init__()
+        self.dt = dt
+        self.event_types = event_types
+        
+        # 初始化 Hiformer 模块
+        self.hiformer = Hiformer(char_dim, lex_dim, synt_dim, dt)
+        
+        # 初始化层次注意力融合模块
+        self.attention_fusion = HierarchicalAttentionFusion(dt, event_types)
+        
+    def forward(self, char_embed, lex_embed, synt_embed, event_type):
+        # Hiformer 特征融合
+        fused_embed = self.hiformer(char_embed, lex_embed, synt_embed)
+        
+        # 双路径门控融合
+        gate_fused = self.dual_path_gate_fusion(fused_embed)
+        
+        # 层次注意力融合
+        attention_fused = self.attention_fusion(gate_fused, event_type)
+        
+        return attention_fused
+    
+    def dual_path_gate_fusion(self, fused_embed):
+        # 实现双路径门控融合机制
+        # 这里假设输入是二维张量 (seq_len, dt)
+        seq_len, dt = fused_embed.size()
+        ei = fused_embed.unsqueeze(1).repeat(1, seq_len, 1)
+        ej = fused_embed.unsqueeze(0).repeat(seq_len, 1, 1)
+        
+        fused = []
+        for i in range(seq_len):
+            for j in range(seq_len):
+                fused.append(self.dual_path_gate(ei[i, j], ej[i, j]))
+        
+        return torch.stack(fused).view(seq_len, seq_len, -1)
+    
+    def dual_path_gate(self, ei, ej):
+        # 定义双路径门控函数
+        concatenated = torch.cat([ei, ej], dim=-1)
+        g = torch.sigmoid(nn.Linear(2 * self.dt, self.dt)(concatenated))
+        fused = g * ei + (1 - g) * ej
+        return fused
